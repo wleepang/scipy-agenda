@@ -1,15 +1,17 @@
 import re
 import argparse
 from datetime import datetime, timedelta
+from textwrap import dedent
 
 import arrow
 from ics import Calendar, Event
+from bs4 import BeautifulSoup
 
 parser = argparse.ArgumentParser()
 
 parser.add_argument(
     'infile',
-    help='path to input agenda (plain text)')
+    help='path to input agenda (html file)')
 
 parser.add_argument(
     '-o',
@@ -18,76 +20,88 @@ parser.add_argument(
     help='path to output .ics file')
 
 
-def parse_agenda(filepath):
+def parse_agenda(soup):
     """
-    parse a plaintext agenda into events
+    parse an html soup agenda into events
     """
-    # get a whitespace cleaned list of lines
-    lines = []
-    with open(filepath, 'r') as f:
-        lines = f.readlines()
-        lines = [line.strip() for line in lines if line.strip()]
-
-    # agenda items are in sets of lines with a rough hierarchy
-    # [date]
-    # .. [timestart] - [timeend]
-    # .. [title]
-    # .. [details...]
-    # .. "Add to My Agenda"
-    events = []
+    agenda_rows = (
+        soup
+        .select_one('.agenda-row.by_date_item')
+        .select('.agenda-date, .time-event-row:not(.filtered_out)')
+    )
     curdate = None
-    event = []
-    for line in lines:
-        if re.search('\d+/\d+/\d+', line):
-            curdate = line
+    events = []
+    for row in agenda_rows:
+        if 'agenda-date' in row.attrs['class']:
+            curdate = row.h4.text
+        elif 'time-event-row' in row.attrs['class']:
+            event = {
+                'date': curdate,
+                'times': row.select_one('.time').span.text.strip(),
+                'title': row.select_one('.session_name').text.strip(),
+                'location': row.select_one('.session_location').text.strip(),
+            }
 
-        elif re.search('add to my agenda', line, re.I):
-            # wrap up the event
-            # add to list of events
-            event.insert(0, curdate)
-            events += [event]
-            event = []
+            event['times'] = (
+                re.match(
+                    '(\d+:\d+\s+[ap]m+).*?(\d+:\d+\s+[ap]m)', 
+                    event['times']
+                )
+                .groups()
+            )
 
-        else:
-            rex = re.match('.*\t(.*)', line)
-            if rex:
-                line = rex.groups(1)[0]
+            speakers = [
+                speaker.text.strip()
+                for speaker in row.select('.speaker_name')
+            ]
+            event.update(speakers=', '.join(speakers))
+
+            if row.select_one('.track_name'):
+                event.update(track=row.select_one('.track_name').text.strip())
             
-            event += [line]
+            events += [event]
+        else:
+            print('skipping row:', row)
 
     return events
 
-def parse_event(event):
+
+def create_event(event):
     """
-    parse lines for an event into a dictionary
+    convert event dictionary to Event object
     """
-
-    date, times, title, *details = event
-
-    times = re.match('(\d+:\d+\s+[ap]m+).*?(\d+:\d+\s+[ap]m)', times).groups()
-
     dtformat = '%m/%d/%Y %I:%M %p'
     dtstart = arrow.get(
-        datetime.strptime(f"{date} {times[0]}".upper(), dtformat),
+        datetime.strptime(f"{event['date']} {event['times'][0]}".upper(), dtformat),
         'US/Central')
 
     dtend = arrow.get(
-        datetime.strptime(f"{date} {times[1]}".upper(), dtformat),
+        datetime.strptime(f"{event['date']} {event['times'][1]}".upper(), dtformat),
         'US/Central')
 
-    location = details[-1]
-    description = details[:-1] if len(details) > 1 else details
+    description = [event['title']]
 
+    if event['speakers']:
+        description += [event['speakers']]
+
+    if event.get('track'):
+        description += [event['track']]
+    
     return Event(
-        name=title,
+        name=event['title'],
         begin=dtstart,
         end=dtend,
-        location=location,
-        description=', '.join(description)
+        location=event['location'],
+        description='\n'.join(description)
     )
 
+
 def main(args):
-    events = [parse_event(event) for event in parse_agenda(args.infile)]
+
+    with open(args.infile, 'r') as html:
+        soup = BeautifulSoup(html, 'html.parser')
+
+    events = [create_event(event) for event in parse_agenda(soup)]
 
     from pprint import pprint; pprint(events)
     cal = Calendar(events=events)
